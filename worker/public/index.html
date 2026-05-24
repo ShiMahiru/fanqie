@@ -34,7 +34,8 @@
 <script>
 const $=id=>document.getElementById(id);let rankings=[];let rankGroups=[];let activeRankId='';let rankBooks=[];let searchBooksCache=[];let chaptersCollapsed=true;
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-const API_BASE=((window.__API_BASE__||document.querySelector('meta[name="api-base"]')?.content||'').replace(/\/$/,''));
+function detectApiBase(){const explicit=(window.__API_BASE__||document.querySelector('meta[name="api-base"]')?.content||'').trim();if(explicit)return explicit.replace(/\/$/,'');const p=location.pathname||'/';if(p==='/'||p==='/index.html')return '';const idx=p.lastIndexOf('/');const dir=idx>0?p.slice(0,idx):'';return dir.replace(/\/$/,'');}
+const API_BASE=detectApiBase();
 function buildApiUrl(path){if(/^https?:\/\//i.test(path))return path;const clean=path.startsWith('/')?path:`/${path}`;return `${API_BASE}${clean}`;}
 async function api(path,opts={}){const r=await fetch(buildApiUrl(path),{headers:{'Content-Type':'application/json'},...opts});const t=await r.text();let d;try{d=JSON.parse(t)}catch{d=t}if(!r.ok)throw d;return d}
 function err(e){return `<div class="error">${esc((e&&e.error)||e.message||e)}</div>`}
