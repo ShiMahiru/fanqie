@@ -55,7 +55,7 @@ SUITE_FEATURES = [
         ],
     },
     {
-        'source': 'fanqie-reader',
+        'source': 'https://github.com/zlm6666/fanqie-reader',
         'label': '无登录阅读器',
         'local_api': [
             '/api/search',
