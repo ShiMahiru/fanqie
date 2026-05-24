@@ -55,15 +55,21 @@ SUITE_FEATURES = [
         ],
     },
     {
-        'source': 'fanqie-reader',
-        'label': '无登录阅读器',
+        'source': 'https://github.com/zlm6666/fanqie-reader',
+        'label': '无登录阅读器（已提取接口）',
         'local_api': [
+            '/api/search-filters',
             '/api/search',
+            '/api/latest-updates',
+            '/api/recommend',
+            '/api/top-books',
             '/api/novels',
             '/api/novels/<id>',
             '/api/novels/<id>/chapters',
             '/api/novels/<id>/chapters/<chapter_id>',
             '/api/novels/<id>/download',
+            '/api/mcp/get_book_detail',
+            '/api/mcp/get_chapter_content',
         ],
     },
 ]
