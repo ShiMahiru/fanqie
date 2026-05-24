@@ -436,15 +436,19 @@ function buildInterfaceMap() {
 }
 
 async function fetchText(url, extraHeaders = {}) {
+  const headers = {
+    accept: '*/*',
+    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'cache-control': 'no-cache',
+    pragma: 'no-cache',
+    ...extraHeaders,
+  };
+  // Cloudflare Workers forbid manually setting `user-agent` on subrequests.
+  // Remove it defensively to avoid runtime TypeError and stalled interfaces.
+  delete headers['user-agent'];
+  delete headers.User-Agent;
   const response = await fetch(url, {
-    headers: {
-      'user-agent': UA_WEB,
-      accept: '*/*',
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'cache-control': 'no-cache',
-      pragma: 'no-cache',
-      ...extraHeaders,
-    },
+    headers,
     redirect: 'follow',
     cf: { cacheTtl: 0, cacheEverything: false },
   });
