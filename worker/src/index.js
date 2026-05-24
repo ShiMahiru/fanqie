@@ -436,7 +436,18 @@ function buildInterfaceMap() {
 }
 
 async function fetchText(url, extraHeaders = {}) {
-  const response = await fetch(url, { headers: { 'user-agent': UA_WEB, accept: '*/*', ...extraHeaders } });
+  const response = await fetch(url, {
+    headers: {
+      'user-agent': UA_WEB,
+      accept: '*/*',
+      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'cache-control': 'no-cache',
+      pragma: 'no-cache',
+      ...extraHeaders,
+    },
+    redirect: 'follow',
+    cf: { cacheTtl: 0, cacheEverything: false },
+  });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.text();
 }
