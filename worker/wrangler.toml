@@ -1,0 +1,8 @@
+name = "fanqie-novel-worker"
+main = "src/index.js"
+compatibility_date = "2026-05-24"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "public"
+binding = "ASSETS"
