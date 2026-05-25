@@ -5,6 +5,9 @@ import { generateABogus } from './a_bogus.js';
 
 const UA_WEB = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UPSTREAM_TIMEOUT_MS = 8000;
+const RANKING_RETRY_LIMIT = 5;
+const TXT_EXPORT_CONCURRENCY = 20;
+const TXT_EXPORT_RETRY_CONCURRENCY = 6;
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': '*',
@@ -41,7 +44,13 @@ async function handleGet(request, url, env) {
   if (path === '/api/search-filters') return json(fetchSearchFilters());
   if (path === '/api/rankings' || path === '/api/mcp/list_rankings') return json(fetchLeaderboards());
   if (path === '/api/ranking' || path === '/api/mcp/get_ranking') {
-    return json(await fetchRankingBooks(url.searchParams.get('ranking_id') || '', url.searchParams.get('offset') || '0', url.searchParams.get('limit') || '30'));
+    return json(await fetchRankingBooks(
+      url.searchParams.get('ranking_id') || '',
+      url.searchParams.get('offset') || '0',
+      url.searchParams.get('limit') || '30',
+      boolish(url.searchParams.get('live_only') || '0'),
+      boolish(url.searchParams.get('snapshot') || '0'),
+    ));
   }
   if (path === '/api/search') {
     return json(await fetchSearch(
@@ -97,19 +106,53 @@ function fetchLeaderboards() {
   return { source: 'worker-snapshot', snapshot_date: new Date().toISOString(), count: DATA.rankings.length, groups: DATA.groups, rankings: DATA.rankings, error: '' };
 }
 
-async function fetchRankingBooks(rankingId, offsetRaw, limitRaw) {
+async function fetchRankingBooks(rankingId, offsetRaw, limitRaw, liveOnly = false, snapshotOnly = false) {
   const ranking = DATA.rankings.find((item) => item.id === rankingId || item.name === rankingId) || DATA.rankings[0];
-  if (!ranking) return { ranking_id: '', ranking_name: '', count: 0, total: 0, books: [], source: 'fanqie-web-rank-category-list', error: '未知榜单。' };
+  if (!ranking) {
+    return { ranking_id: '', ranking_name: '', count: 0, total: 0, books: [], source: 'fanqie-web-rank-category-list', error: '未知榜单。', live_ok: false, retry_count: 0, retry_limit: RANKING_RETRY_LIMIT, retry_errors: [] };
+  }
   const offset = Math.max(0, Number.parseInt(offsetRaw, 10) || 0);
   const limit = Math.max(1, Math.min(Number.parseInt(limitRaw, 10) || 30, 100));
-  try {
-    return await fetchLiveRankingBooks(ranking, offset, limit);
-  } catch (error) {
-    return fetchSnapshotRankingBooks(ranking, offset, limit, error);
+
+  if (snapshotOnly) {
+    return fetchSnapshotRankingBooks(ranking, offset, limit, null, {
+      retry_count: RANKING_RETRY_LIMIT,
+      retry_limit: RANKING_RETRY_LIMIT,
+      retry_errors: [],
+    });
   }
+
+  const attempts = liveOnly ? 1 : RANKING_RETRY_LIMIT;
+  const retryErrors = [];
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetchLiveRankingBooks(ranking, offset, limit, attempt, retryErrors);
+    } catch (error) {
+      lastError = error;
+      retryErrors.push(String(error && error.message ? error.message : error));
+      if (attempt < attempts) await sleep(Math.min(350 * attempt, 1200));
+    }
+  }
+
+  if (liveOnly) {
+    return rankingResponse(ranking, [], 0, 'fanqie-web-rank-category-list', '', String(lastError && lastError.message ? lastError.message : lastError || '官方接口暂时不可访问。'), {
+      live_ok: false,
+      retry_count: 1,
+      retry_limit: RANKING_RETRY_LIMIT,
+      retry_errors: retryErrors,
+    });
+  }
+
+  return rankingResponse(ranking, [], 0, 'fanqie-web-rank-category-list', '', String(lastError && lastError.message ? lastError.message : lastError || '官方接口暂时不可访问。'), {
+    live_ok: false,
+    retry_count: attempts,
+    retry_limit: RANKING_RETRY_LIMIT,
+    retry_errors: retryErrors,
+  });
 }
 
-async function fetchLiveRankingBooks(ranking, offset, limit) {
+async function fetchLiveRankingBooks(ranking, offset, limit, retryCount = 1, retryErrors = []) {
   const params = new URLSearchParams({
     app_id: '2503',
     rank_list_type: String(ranking.rank_list_type || 3),
@@ -124,17 +167,28 @@ async function fetchLiveRankingBooks(ranking, offset, limit) {
   const { payload, sourceUrl } = await fanqieJsonGet('/api/rank/category/list', params, referer);
   if (payload.code !== 0) throw new Error(payload.message || 'rank api failed');
   const { books, total } = booksFromCategoryPayload(payload, offset + 1);
-  return rankingResponse(ranking, books, total, 'fanqie-web-rank-category-list', sourceUrl, '');
+  if (!books.length) throw new Error('排行榜接口返回空列表');
+  return rankingResponse(ranking, books, total, 'fanqie-web-rank-category-list', sourceUrl, '', {
+    live_ok: true,
+    retry_count: retryCount,
+    retry_limit: RANKING_RETRY_LIMIT,
+    retry_errors: retryErrors,
+  });
 }
 
-function fetchSnapshotRankingBooks(ranking, offset, limit, error) {
+function fetchSnapshotRankingBooks(ranking, offset, limit, error, meta = {}) {
   const key = `${ranking.gender}|${ranking.rankMold}|${ranking.category_id}`;
   const bucket = DATA.rankSnapshot[key] || { books: [], total: 0 };
   const books = bucket.books.slice(offset, offset + limit);
-  return rankingResponse(ranking, books, bucket.total || bucket.books.length, 'worker-snapshot', '', books.length ? '' : String(error && error.message ? error.message : error));
+  return rankingResponse(ranking, books, bucket.total || bucket.books.length, 'worker-snapshot', '', books.length ? '' : String(error && error.message ? error.message : error), {
+    live_ok: false,
+    retry_count: meta.retry_count || 0,
+    retry_limit: meta.retry_limit || RANKING_RETRY_LIMIT,
+    retry_errors: meta.retry_errors || [],
+  });
 }
 
-function rankingResponse(ranking, books, total, source, sourceUrl, error) {
+function rankingResponse(ranking, books, total, source, sourceUrl, error, meta = {}) {
   return {
     ranking_id: ranking.id,
     ranking_name: ranking.name,
@@ -148,6 +202,10 @@ function rankingResponse(ranking, books, total, source, sourceUrl, error) {
     source,
     source_url: sourceUrl,
     error,
+    live_ok: Boolean(meta.live_ok),
+    retry_count: meta.retry_count || 0,
+    retry_limit: meta.retry_limit || RANKING_RETRY_LIMIT,
+    retry_errors: meta.retry_errors || [],
   };
 }
 
@@ -155,7 +213,7 @@ function booksFromCategoryPayload(payload, baseRank = 1) {
   const data = payload && typeof payload.data === 'object' ? payload.data : {};
   const raw = Array.isArray(data.book_list) ? data.book_list : (Array.isArray(data.bookList) ? data.bookList : (Array.isArray(data.list) ? data.list : []));
   const books = raw.map((item, index) => normalizeRankBook(item, baseRank + index)).filter(Boolean);
-  return { books, total: Number.parseInt(data.total_num, 10) || books.length };
+  return { books, total: Number.parseInt(data.total_num, 10) || books.length, rankVersion: String(data.rankVersion || data.rank_version || '') };
 }
 
 function normalizeRankBook(item, rank) {
@@ -212,6 +270,7 @@ async function fetchSearch(query, queryType = '1', filterValue = '127,127,127,12
     query_type: String(queryType || '1'),
     query_word: query,
   });
+  let apiError = null;
   try {
     const { payload } = await fanqieJsonGet('/api/author/search/search_book/v1', params, `https://fanqienovel.com/search/${encodeURIComponent(query)}`);
     const data = payload && typeof payload.data === 'object' ? payload.data : {};
@@ -379,45 +438,95 @@ async function fetchChapters(bookId) {
   return chapters;
 }
 
-async function fetchChapterContent(chapterId) {
-  if (CHAPTER_CACHE.has(chapterId)) return CHAPTER_CACHE.get(chapterId);
+async function fetchChapterContent(chapterId, allowHtml = true) {
+  chapterId = String(chapterId);
+  const cached = CHAPTER_CACHE.get(chapterId);
+  if (chapterContentOk(cached)) return cached;
   try {
-    const { payload } = await fanqieJsonGet('/api/reader/full', new URLSearchParams({ itemId: String(chapterId) }), `https://fanqienovel.com/reader/${chapterId}`);
+    const { payload } = await fanqieJsonGet('/api/reader/full', new URLSearchParams({ itemId: chapterId }), `https://fanqienovel.com/reader/${chapterId}`);
     const chapterData = payload?.data?.chapterData || {};
     const content = cleanText(stripTags(String(chapterData.content || '')));
     if (content) {
-      const result = { id: String(chapterId), title: cleanText(String(chapterData.title || '').trim()), content, source: 'fanqie-reader-full' };
+      const result = { id: chapterId, title: cleanText(String(chapterData.title || '').trim()), content, source: 'fanqie-reader-full' };
       CHAPTER_CACHE.set(chapterId, result);
       return result;
     }
   } catch (error) {
-    // Fall through to the rendered reader page.
+    apiError = error;
   }
+  if (!allowHtml) throw new Error(apiError ? String(apiError.message || apiError) : '章节正文为空');
   const page = await fetchText(`https://fanqienovel.com/reader/${chapterId}`);
   const state = parseInitialState(page);
   if (!state) throw new Error('未解析到章节初始状态');
   const chapterData = state?.reader?.chapterData || {};
-  const result = { id: String(chapterId), title: cleanText(String(chapterData.title || '').trim()), content: cleanText(stripTags(String(chapterData.content || ''))), fallback: 'reader-html' };
+  const content = cleanText(stripTags(String(chapterData.content || '')));
+  if (!content) throw new Error('章节正文为空');
+  const result = { id: chapterId, title: cleanText(String(chapterData.title || '').trim()), content, fallback: 'reader-html' };
   CHAPTER_CACHE.set(chapterId, result);
   return result;
 }
 
-async function downloadNovel(bookId) {
-  const detail = await fetchBookDetail(bookId);
-  const parts = [`${detail.title}\n作者：${detail.author}\n\n${detail.description}\n`];
-  const chapters = (detail.chapters || []).slice(0, 200);
-  for (const chapter of chapters) {
-    try {
-      const content = await fetchChapterContent(chapter.id);
-      parts.push(`\n${content.title || chapter.title}\n\n${content.content || ''}\n`);
-    } catch (error) {
-      parts.push(`\n${chapter.title}\n\n[无法获取：${String(error.message || error)}]\n`);
-    }
-  }
-  const safeName = encodeURIComponent((detail.title || bookId).replace(/[\\/:*?"<>|]+/g, '_') + '.txt');
-  return new Response(parts.join('\n'), { headers: { 'content-type': 'text/plain; charset=utf-8', 'content-disposition': `attachment; filename="novel.txt"; filename*=UTF-8''${safeName}` } });
+function chapterContentOk(chapter) {
+  return Boolean(chapter && typeof chapter === 'object' && String(chapter.content || '').trim());
 }
 
+async function fetchChapterBatch(chapters, indexes, concurrency, allowHtml = true) {
+  const fetched = new Map();
+  const errors = new Map();
+  const queue = Array.from(indexes || []);
+  let next = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), queue.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < queue.length) {
+      const index = queue[next];
+      next += 1;
+      const chapter = chapters[index];
+      const cached = CHAPTER_CACHE.get(String(chapter.id || ''));
+      if (chapterContentOk(cached)) {
+        fetched.set(index, cached);
+        continue;
+      }
+      try {
+        const content = await fetchChapterContent(chapter.id, allowHtml);
+        if (chapterContentOk(content)) fetched.set(index, content);
+        else errors.set(index, '章节正文为空');
+      } catch (error) {
+        errors.set(index, String(error.message || error));
+      }
+    }
+  }));
+  return { fetched, errors };
+}
+async function downloadNovel(bookId) {
+  const detail = await fetchBookDetail(bookId);
+  const chapters = detail.chapters || [];
+  const fetched = new Array(chapters.length);
+  const errors = new Map();
+  const indexes = chapters.map((_, index) => index);
+
+  const first = await fetchChapterBatch(chapters, indexes, TXT_EXPORT_CONCURRENCY, false);
+  first.fetched.forEach((value, key) => { fetched[key] = value; });
+  first.errors.forEach((value, key) => { errors.set(key, value); });
+
+  const missing = indexes.filter((index) => !chapterContentOk(fetched[index]));
+  if (missing.length) {
+    const retry = await fetchChapterBatch(chapters, missing, TXT_EXPORT_RETRY_CONCURRENCY, true);
+    retry.fetched.forEach((value, key) => { fetched[key] = value; });
+    retry.errors.forEach((value, key) => { errors.set(key, value); });
+  }
+
+  const parts = [String(detail.title || bookId) + '\n作者：' + String(detail.author || '') + '\n\n' + String(detail.description || '') + '\n'];
+  chapters.forEach((chapter, index) => {
+    const content = fetched[index];
+    if (chapterContentOk(content)) {
+      parts.push('\n' + String(content.title || chapter.title || '') + '\n\n' + String(content.content || '') + '\n');
+    } else {
+      parts.push('\n' + String(chapter.title || '') + '\n\n[无法获取：' + String(errors.get(index) || '多次重试后仍未获取到正文') + ']\n');
+    }
+  });
+  const safeName = encodeURIComponent((detail.title || bookId).replace(/[\\/:*?"<>|]+/g, '_') + '.txt');
+  return new Response(parts.join('\n'), { headers: { 'content-type': 'text/plain; charset=utf-8', 'content-disposition': 'attachment; filename="novel.txt"; filename*=UTF-8\'\'' + safeName } });
+}
 function buildStats() {
   return { generated_at: new Date().toISOString(), anonymous: true, login_removed: true, features: DATA.features, ranking_groups: DATA.groups.length, ranking_categories: DATA.rankings.length, ranking_count: DATA.rankings.length, shelf_total: 0, detail_cache_total: DETAIL_CACHE.size, chapter_cache_total: CHAPTER_CACHE.size, interfaces_same: false };
 }
@@ -466,6 +575,14 @@ async function fanqieJsonGet(path, params, referer = 'https://fanqienovel.com/')
   const sourceUrl = signedFanqieUrl(path, params);
   const payload = await fetchJson(sourceUrl, { referer });
   return { payload, sourceUrl };
+}
+
+function boolish(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').toLowerCase());
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function boundedInt(value, fallback, min, max) {

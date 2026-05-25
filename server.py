@@ -25,6 +25,11 @@ SHELF = {}
 CHAPTER_CACHE = {}
 DETAIL_CACHE = {}
 RANKING_CACHE = {}
+RANKING_RETRY_LIMIT = 5
+DOWNLOAD_WORKERS = 48
+DOWNLOAD_RETRY_WORKERS = 16
+CHAPTER_FETCH_TIMEOUT = 6
+CHAPTER_RETRY_TIMEOUT = 15
 
 SUITE_FEATURES = [
     {
@@ -271,13 +276,13 @@ def friendly_external_error(exc):
     text = str(exc)
     lowered = text.lower()
     if 'handshake operation timed out' in lowered or '_ssl.c' in lowered:
-        return '官方入口刷新超时，已使用本地榜单快照。'
+        return '官方入口刷新超时。'
     if 'timed out' in lowered or 'timeout' in lowered:
-        return '官方接口请求超时，已使用本地榜单快照。'
+        return '官方接口请求超时。'
     if 'urlopen error' in lowered:
-        return '官方接口暂时不可访问，已使用本地榜单快照。'
+        return '官方接口暂时不可访问。'
     if 'expecting value' in lowered and 'char 0' in lowered:
-        return '官方接口暂时不可访问，已返回本地可用结果。'
+        return '官方接口暂时不可访问。'
     return text
 
 
@@ -878,7 +883,7 @@ def unavailable_ranking_response(ranking_id, error=''):
     }
 
 
-def fetch_ranking_books(ranking_id=None, offset=0, limit=30):
+def fetch_ranking_books(ranking_id=None, offset=0, limit=30, live_only=False, snapshot_only=False):
     fetch_web_categories(False)
     if not ranking_id:
         ranking_id = RANKING_LIST[0]['id'] if RANKING_LIST else ''
@@ -890,21 +895,93 @@ def fetch_ranking_books(ranking_id=None, offset=0, limit=30):
     limit = bounded_int(limit, 30, minimum=1, maximum=100)
     normalized = meta['id']
     error = ''
+    retry_errors = []
+    retry_count = RANKING_RETRY_LIMIT if snapshot_only else 0
     source_url = ''
     source = 'fanqie-web-rank-category-list'
-    try:
-        books, total, source_url = fetch_live_category_books(meta, offset, limit)
-    except Exception as exc:
-        error = friendly_external_error(exc)
-        books, total = fetch_har_category_books(meta, offset, limit)
-        if books:
-            source = 'local-rank-snapshot'
-        else:
-            cached = RANKING_CACHE.get(normalized, {})
-            cached_books = list(cached.get('books', []))
-            books = cached_books[offset:offset + limit]
-            total = intish(cached.get('total'), len(cached_books))
-            source = 'memory-cache' if books else 'fanqie-web-rank-category-list'
+    books = []
+    total = 0
+
+    if not snapshot_only:
+        attempts = 1 if live_only else RANKING_RETRY_LIMIT
+        for attempt in range(1, attempts + 1):
+            retry_count = attempt
+            try:
+                books, total, source_url = fetch_live_category_books(meta, offset, limit)
+                source = 'fanqie-web-rank-category-list'
+                if books:
+                    RANKING_CACHE[normalized] = {'books': books, 'total': total, 'fetched_at': now_iso(), 'source': source}
+                return {
+                    'ranking_id': normalized,
+                    'ranking_name': meta.get('display_name') or meta.get('name'),
+                    'category_id': meta.get('category_id'),
+                    'gender': meta.get('gender'),
+                    'rankMold': meta.get('rankMold'),
+                    'source_api': meta.get('source_api'),
+                    'count': len(books),
+                    'total': total,
+                    'books': books,
+                    'source': source,
+                    'source_url': source_url,
+                    'error': '',
+                    'live_ok': True,
+                    'retry_count': retry_count,
+                    'retry_limit': RANKING_RETRY_LIMIT,
+                    'retry_errors': retry_errors,
+                }
+            except Exception as exc:
+                error = friendly_external_error(exc)
+                retry_errors.append(error)
+                if attempt < attempts:
+                    time.sleep(min(0.35 * attempt, 1.2))
+
+        if live_only:
+            return {
+                'ranking_id': normalized,
+                'ranking_name': meta.get('display_name') or meta.get('name'),
+                'category_id': meta.get('category_id'),
+                'gender': meta.get('gender'),
+                'rankMold': meta.get('rankMold'),
+                'source_api': meta.get('source_api'),
+                'count': 0,
+                'total': 0,
+                'books': [],
+                'source': 'fanqie-web-rank-category-list',
+                'source_url': source_url,
+                'error': error or '官方接口暂时不可访问。',
+                'live_ok': False,
+                'retry_count': retry_count,
+                'retry_limit': RANKING_RETRY_LIMIT,
+                'retry_errors': retry_errors,
+            }
+        return {
+            'ranking_id': normalized,
+            'ranking_name': meta.get('display_name') or meta.get('name'),
+            'category_id': meta.get('category_id'),
+            'gender': meta.get('gender'),
+            'rankMold': meta.get('rankMold'),
+            'source_api': meta.get('source_api'),
+            'count': 0,
+            'total': 0,
+            'books': [],
+            'source': 'fanqie-web-rank-category-list',
+            'source_url': source_url,
+            'error': error or '官方接口暂时不可访问。',
+            'live_ok': False,
+            'retry_count': retry_count,
+            'retry_limit': RANKING_RETRY_LIMIT,
+            'retry_errors': retry_errors,
+        }
+
+    books, total = fetch_har_category_books(meta, offset, limit)
+    if books:
+        source = 'local-rank-snapshot'
+    else:
+        cached = RANKING_CACHE.get(normalized, {})
+        cached_books = list(cached.get('books', []))
+        books = cached_books[offset:offset + limit]
+        total = intish(cached.get('total'), len(cached_books))
+        source = 'memory-cache' if books else 'fanqie-web-rank-category-list'
     if books:
         RANKING_CACHE[normalized] = {'books': books, 'total': total, 'fetched_at': now_iso(), 'source': source}
     return {
@@ -920,8 +997,11 @@ def fetch_ranking_books(ranking_id=None, offset=0, limit=30):
         'source': source,
         'source_url': source_url,
         'error': error if not books else '',
+        'live_ok': False,
+        'retry_count': retry_count,
+        'retry_limit': RANKING_RETRY_LIMIT,
+        'retry_errors': retry_errors,
     }
-
 
 def normalize_simple_book(item, rank=0):
     if not isinstance(item, dict):
@@ -1217,9 +1297,12 @@ def fetch_full_chapters(book_id, fallback=None):
         live_chapters = []
     return merge_chapters(live_chapters, fallback or [])
 
-def fetch_chapter_content(chapter_id, timeout=8):
-    if chapter_id in CHAPTER_CACHE:
-        return CHAPTER_CACHE[chapter_id]
+def fetch_chapter_content(chapter_id, timeout=8, allow_html=True):
+    chapter_id = str(chapter_id)
+    cached = CHAPTER_CACHE.get(chapter_id)
+    if chapter_content_ok(cached):
+        return cached
+    api_error = None
     try:
         payload, _ = fanqie_get_reader_full(chapter_id, timeout=timeout)
         ch_data = payload.get('data', {}).get('chapterData', {}) if isinstance(payload, dict) else {}
@@ -1229,14 +1312,17 @@ def fetch_chapter_content(chapter_id, timeout=8):
             raw = ''
         content = decrypt_pua(strip_tags(raw))
         if content:
-            result = {'id': str(chapter_id), 'title': decrypt_pua(title), 'content': content}
+            result = {'id': chapter_id, 'title': decrypt_pua(title), 'content': content}
             CHAPTER_CACHE[chapter_id] = result
             return result
-    except Exception:
-        snapshot_chapter = load_reader_har_snapshot().get('chapters', {}).get(str(chapter_id))
-        if snapshot_chapter:
+    except Exception as exc:
+        api_error = exc
+        snapshot_chapter = load_reader_har_snapshot().get('chapters', {}).get(chapter_id)
+        if chapter_content_ok(snapshot_chapter):
             CHAPTER_CACHE[chapter_id] = snapshot_chapter
             return snapshot_chapter
+    if not allow_html:
+        raise RuntimeError(str(api_error) if api_error else '章节正文为空；接口暂不可用。')
     html = http_get(f'https://fanqienovel.com/reader/{chapter_id}', UA_WEB, timeout=timeout)
     state = parse_initial_state(html)
     if not state:
@@ -1248,10 +1334,52 @@ def fetch_chapter_content(chapter_id, timeout=8):
     if not isinstance(raw, str):
         raw = ''
     content = decrypt_pua(strip_tags(raw))
-    result = {'id': str(chapter_id), 'title': decrypt_pua(title), 'content': content}
+    if not content:
+        snapshot_chapter = load_reader_har_snapshot().get('chapters', {}).get(chapter_id)
+        if chapter_content_ok(snapshot_chapter):
+            CHAPTER_CACHE[chapter_id] = snapshot_chapter
+            return snapshot_chapter
+        raise RuntimeError('章节正文为空；接口暂不可用。')
+    result = {'id': chapter_id, 'title': decrypt_pua(title), 'content': content}
     CHAPTER_CACHE[chapter_id] = result
     return result
 
+
+def chapter_content_ok(chapter):
+    return isinstance(chapter, dict) and bool(str(chapter.get('content') or '').strip())
+
+
+def fetch_chapter_batch(chapters, indexes, workers, timeout, allow_html=True):
+    fetched = {}
+    errors = {}
+    indexes = list(indexes or [])
+    if not indexes:
+        return fetched, errors
+    max_workers = max(1, min(workers, len(indexes)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {}
+        for idx in indexes:
+            ch = chapters[idx]
+            chapter_id = str(ch.get('id') or '')
+            if not chapter_id:
+                errors[idx] = '章节ID为空'
+                continue
+            cached = CHAPTER_CACHE.get(chapter_id)
+            if chapter_content_ok(cached):
+                fetched[idx] = cached
+                continue
+            future_map[pool.submit(fetch_chapter_content, chapter_id, timeout, allow_html)] = idx
+        for fut in concurrent.futures.as_completed(future_map):
+            idx = future_map[fut]
+            try:
+                got = fut.result()
+                if chapter_content_ok(got):
+                    fetched[idx] = got
+                else:
+                    errors[idx] = '章节正文为空'
+            except Exception as exc:
+                errors[idx] = str(exc)
+    return fetched, errors
 
 
 def build_suite_stats():
@@ -1372,14 +1500,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(fetch_leaderboards(qs.get('refresh', ['0'])[0] == '1'))
             if path == '/api/ranking':
                 try:
-                    return self.send_json(fetch_ranking_books(qs.get('ranking_id', [''])[0], qs.get('offset', ['0'])[0], qs.get('limit', ['30'])[0]))
+                    return self.send_json(fetch_ranking_books(qs.get('ranking_id', [''])[0], qs.get('offset', ['0'])[0], qs.get('limit', ['30'])[0], live_only=boolish(qs.get('live_only', ['0'])[0]), snapshot_only=boolish(qs.get('snapshot', ['0'])[0])))
                 except Exception as exc:
                     return self.fail(exc, 504)
             if path == '/api/mcp/list_rankings':
                 return self.send_json(fetch_leaderboards(boolish(qs.get('refresh', ['0'])[0])))
             if path == '/api/mcp/get_ranking':
                 try:
-                    return self.send_json(fetch_ranking_books(qs.get('ranking_id', [''])[0], qs.get('offset', ['0'])[0], qs.get('limit', ['30'])[0]))
+                    return self.send_json(fetch_ranking_books(qs.get('ranking_id', [''])[0], qs.get('offset', ['0'])[0], qs.get('limit', ['30'])[0], live_only=boolish(qs.get('live_only', ['0'])[0]), snapshot_only=boolish(qs.get('snapshot', ['0'])[0])))
                 except Exception as exc:
                     return self.fail(exc, 504)
             if path == '/api/mcp/get_book_detail':
@@ -1402,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r'^/api/novels/(\d+)/chapters$', path)
             if m:
                 detail = fetch_book_detail(m.group(1))
-                chapters = fetch_full_chapters(m.group(1), detail.get('chapters', []))
+                chapters = detail.get('chapters') or fetch_full_chapters(m.group(1), [])
                 return self.send_json({'chapters': chapters, 'total': len(chapters), 'page': 1, 'pages': 1, 'per_page': len(chapters) or 1, 'novel_id': m.group(1)})
             m = re.match(r'^/api/novels/(\d+)/chapters/(\d+)$', path)
             if m:
@@ -1415,28 +1543,27 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r'^/api/novels/(\d+)/download$', path)
             if m:
                 detail = fetch_book_detail(m.group(1))
-                chapters = fetch_full_chapters(m.group(1), detail.get('chapters', []))
+                chapters = detail.get('chapters') or fetch_full_chapters(m.group(1), [])
                 parts = [f"{detail.get('title')}\n作者：{detail.get('author')}\n\n{detail.get('description')}\n"]
                 fetched = {}
+                errors = {}
                 if chapters:
-                    workers = min(6, len(chapters))
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                        future_map = {}
-                        for idx, ch in enumerate(chapters):
-                            cached = CHAPTER_CACHE.get(ch['id'])
-                            if cached:
-                                fetched[idx] = cached
-                                continue
-                            future_map[pool.submit(fetch_chapter_content, ch['id'], 8)] = idx
-                        for fut in concurrent.futures.as_completed(future_map):
-                            idx = future_map[fut]
-                            try:
-                                fetched[idx] = fut.result(timeout=0)
-                            except Exception as exc:
-                                fetched[idx] = {'title': chapters[idx].get('title', ''), 'content': f'[无法获取：{exc}]'}
+                    indexes = list(range(len(chapters)))
+                    first_fetched, first_errors = fetch_chapter_batch(chapters, indexes, DOWNLOAD_WORKERS, CHAPTER_FETCH_TIMEOUT, allow_html=False)
+                    fetched.update(first_fetched)
+                    errors.update(first_errors)
+                    missing = [idx for idx in indexes if not chapter_content_ok(fetched.get(idx))]
+                    if missing:
+                        retry_fetched, retry_errors = fetch_chapter_batch(chapters, missing, DOWNLOAD_RETRY_WORKERS, CHAPTER_RETRY_TIMEOUT, allow_html=True)
+                        fetched.update(retry_fetched)
+                        errors.update(retry_errors)
                 for idx, ch in enumerate(chapters):
-                    got = fetched.get(idx) or {'title': ch.get('title', ''), 'content': '[无法获取：超时]'}
-                    parts.append('\n' + got.get('title', ch['title']) + '\n\n' + got.get('content', '') + '\n')
+                    got = fetched.get(idx)
+                    if chapter_content_ok(got):
+                        parts.append('\n' + got.get('title', ch['title']) + '\n\n' + got.get('content', '') + '\n')
+                    else:
+                        reason = errors.get(idx) or '多次重试后仍未获取到正文'
+                        parts.append('\n' + ch.get('title', '') + '\n\n[无法获取：' + str(reason) + ']\n')
                 body = '\n'.join(parts).encode('utf-8')
                 safe_name = re.sub(r'[\\/:*?"<>|]+', '_', (detail.get('title') or m.group(1)).strip()) or m.group(1)
                 filename = quote(f'{safe_name}.txt')
