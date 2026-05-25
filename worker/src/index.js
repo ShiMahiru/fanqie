@@ -38,6 +38,7 @@ async function handleGet(request, url, env) {
   if (path === '/api/health') {
     return json({ ok: true, mode: 'cloudflare-worker', time: new Date().toISOString(), login_removed: true, features: DATA.features.map((f) => f.source) });
   }
+  if (path === '/api/worker-self-test') return json(await workerSelfTest(url, env));
   if (path === '/api/interfaces') return json(buildInterfaceMap());
   if (path === '/api/capture-summary') return json(DATA.capture);
   if (path === '/api/stats') return json(buildStats());
@@ -100,6 +101,28 @@ async function handlePost(request, url) {
     return json(await fetchBookDetail(novelId));
   }
   return json({ error: 'not found' }, 404);
+}
+
+async function workerSelfTest(url, env) {
+  const result = {
+    ok: true,
+    worker: true,
+    mode: 'cloudflare-worker',
+    time: new Date().toISOString(),
+    has_assets_binding: Boolean(env && env.ASSETS),
+    rankings: DATA.rankings.length,
+    routes: ['/api/health', '/api/rankings', '/api/ranking', '/api/novels/<id>', '/api/novels/<id>/download'],
+  };
+  if (boolish(url.searchParams.get('upstream') || '0')) {
+    const first = DATA.rankings[0];
+    try {
+      const got = await fetchRankingBooks(first && first.id, '0', '1', true, false);
+      result.upstream = { ok: Boolean(got.live_ok), count: got.count || 0, error: got.error || '', retry_errors: got.retry_errors || [] };
+    } catch (error) {
+      result.upstream = { ok: false, count: 0, error: String(error && error.message ? error.message : error) };
+    }
+  }
+  return result;
 }
 
 function fetchLeaderboards() {
