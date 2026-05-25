@@ -4,6 +4,7 @@ import { PUA_MAP } from './pua.js';
 import { generateABogus } from './a_bogus.js';
 
 const UA_WEB = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const UPSTREAM_TIMEOUT_MS = 8000;
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': '*',
@@ -15,11 +16,11 @@ const DETAIL_CACHE = new Map();
 const CHAPTER_CACHE = new Map();
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { headers: JSON_HEADERS });
     const url = new URL(request.url);
     try {
-      if (request.method === 'GET') return await handleGet(request, url);
+      if (request.method === 'GET') return await handleGet(request, url, env);
       if (request.method === 'POST') return await handlePost(request, url);
       return json({ error: 'method not allowed' }, 405);
     } catch (error) {
@@ -28,9 +29,9 @@ export default {
   },
 };
 
-async function handleGet(request, url) {
+async function handleGet(request, url, env) {
   const path = url.pathname;
-  if (path === '/') return html(HTML);
+  if (!path.startsWith('/api/')) return assetOrHtml(request, env);
   if (path === '/api/health') {
     return json({ ok: true, mode: 'cloudflare-worker', time: new Date().toISOString(), login_removed: true, features: DATA.features.map((f) => f.source) });
   }
@@ -38,9 +39,6 @@ async function handleGet(request, url) {
   if (path === '/api/capture-summary') return json(DATA.capture);
   if (path === '/api/stats') return json(buildStats());
   if (path === '/api/search-filters') return json(fetchSearchFilters());
-  if (path === '/api/latest-updates') return json(await fetchRecentUpdates(url.searchParams.get('offset') || '0', url.searchParams.get('limit') || '20'));
-  if (path === '/api/recommend') return json(await fetchRecommendBooks(url.searchParams.get('type') || '3', url.searchParams.get('offset') || '0', url.searchParams.get('limit') || '10'));
-  if (path === '/api/top-books') return json(await fetchTopBooks(url.searchParams.get('offset') || '0', url.searchParams.get('limit') || '200'));
   if (path === '/api/rankings' || path === '/api/mcp/list_rankings') return json(fetchLeaderboards());
   if (path === '/api/ranking' || path === '/api/mcp/get_ranking') {
     return json(await fetchRankingBooks(url.searchParams.get('ranking_id') || '', url.searchParams.get('offset') || '0', url.searchParams.get('limit') || '30'));
@@ -191,8 +189,16 @@ function normalizeSearchText(value) {
 
 function rankSearchResults(query, results) {
   const needle = normalizeSearchText(query);
-  if (!needle) return [...results];
-  return results.filter((item) => normalizeSearchText(item.title) === needle);
+  const rows = [...results];
+  if (!needle) return rows;
+  return rows.sort((a, b) => searchScore(needle, a) - searchScore(needle, b));
+}
+
+function searchScore(needle, item) {
+  const title = normalizeSearchText(item.title);
+  if (title === needle) return 0;
+  if (title.includes(needle)) return 1;
+  return 2;
 }
 
 async function fetchSearch(query, queryType = '1', filterValue = '127,127,127,127', pageIndexRaw = '0', pageCountRaw = '10') {
@@ -293,13 +299,8 @@ function fetchSearchFilters() {
     query_types: [
       { id: '1', name: '书名' },
     ],
-    filter_format: '固定书名搜索，不再提供热度筛选。',
+    filter_format: 'fanqie-reader 兼容书名搜索，只需要 query 参数。',
     captured_filters: ['127,127,127,127'],
-    feeds: {
-      latest_updates: '/api/latest-updates?offset=0&limit=20',
-      recommend: '/api/recommend?type=3&offset=0&limit=10',
-      hot_books: '/api/top-books?offset=0&limit=200',
-    },
   };
 }
 
@@ -429,29 +430,24 @@ function buildInterfaceMap() {
     features: DATA.features,
     capture: DATA.capture,
     canonical: {
-      capture_summary: '/api/capture-summary', rankings: '/api/rankings', ranking_books: '/api/ranking?ranking_id=<web榜单ID>', search_filters: '/api/search-filters', search: '/api/search?query=关键词&query_type=1&filter=127,127,127,127', latest_updates: '/api/latest-updates?offset=0&limit=20', recommend: '/api/recommend?type=3&offset=0&limit=10', hot_books: '/api/top-books?offset=0&limit=200', book_detail: '/api/novels/<book_id>', chapters: '/api/novels/<book_id>/chapters', chapter_content: '/api/novels/<book_id>/chapters/<chapter_id>', download_txt: '/api/novels/<book_id>/download',
+      capture_summary: '/api/capture-summary', rankings: '/api/rankings', ranking_books: '/api/ranking?ranking_id=<web榜单ID>', search_filters: '/api/search-filters', search: '/api/search?query=关键词', book_detail: '/api/novels/<book_id>', chapters: '/api/novels/<book_id>/chapters', chapter_content: '/api/novels/<book_id>/chapters/<chapter_id>', download_txt: '/api/novels/<book_id>/download',
     },
     mcp_aliases: { list_rankings: '/api/mcp/list_rankings', get_ranking: '/api/mcp/get_ranking?ranking_id=<web榜单ID>&offset=0&limit=30', get_book_detail: '/api/mcp/get_book_detail?book_id=<book_id>', get_chapter_content: '/api/mcp/get_chapter_content?chapter_id=<chapter_id>' },
   };
 }
 
+function upstreamSignal() {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
+  }
+  return undefined;
+}
+
 async function fetchText(url, extraHeaders = {}) {
-  const headers = {
-    accept: '*/*',
-    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'cache-control': 'no-cache',
-    pragma: 'no-cache',
-    ...extraHeaders,
-  };
-  // Cloudflare Workers forbid manually setting `user-agent` on subrequests.
-  // Remove it defensively to avoid runtime TypeError and stalled interfaces.
-  delete headers['user-agent'];
-  delete headers.User-Agent;
-  const response = await fetch(url, {
-    headers,
-    redirect: 'follow',
-    cf: { cacheTtl: 0, cacheEverything: false },
-  });
+  const init = { headers: { 'user-agent': UA_WEB, accept: '*/*', ...extraHeaders }, redirect: 'follow' };
+  const signal = upstreamSignal();
+  if (signal) init.signal = signal;
+  const response = await fetch(url, init);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.text();
 }
@@ -574,6 +570,14 @@ function dedupeChapters(chapters) {
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), { status, headers: JSON_HEADERS });
+}
+
+async function assetOrHtml(request, env) {
+  if (env && env.ASSETS) {
+    const response = await env.ASSETS.fetch(request);
+    if (response.status !== 404) return response;
+  }
+  return html(HTML);
 }
 
 function html(body) {

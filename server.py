@@ -293,12 +293,19 @@ def normalize_search_text(value):
 
 def rank_search_results(query, results):
     needle = normalize_search_text(query)
+    rows = list(results)
     if not needle:
-        return list(results)
-    return [
-        item for item in results
-        if normalize_search_text(item.get('title')) == needle
-    ]
+        return rows
+
+    def score(item):
+        title = normalize_search_text(item.get('title'))
+        if title == needle:
+            return 0
+        if needle in title:
+            return 1
+        return 2
+
+    return sorted(rows, key=score)
 
 
 def intish(value, default=0):
@@ -728,16 +735,10 @@ def build_capture_summary():
         'search_snapshots': len(reader_snapshot.get('search', {})),
         'chapter_snapshots': len(reader_snapshot.get('chapters', {})),
         'directory_snapshots': len(reader_snapshot.get('directories', {})),
-        'latest_update_snapshots': len(reader_snapshot.get('latest_updates', [])),
-        'recommend_snapshots': len(reader_snapshot.get('recommend', [])),
-        'top_book_snapshots': len(reader_snapshot.get('top_books', [])),
         'rank_api': '/api/rank/category/list',
         'search_api': '/api/author/search/search_book/v1',
         'reader_api': '/api/reader/full',
         'directory_api': '/api/reader/directory/detail',
-        'latest_api': '/api/rank/recent/update/list',
-        'recommend_api': '/api/rank/recommend/list',
-        'top_books_api': '/api/author/misc/top_book_list/v1/',
         'captured_at': '2026-05-24T18:51:13+08:00',
         'error': HAR_RANK_ERROR,
     }
@@ -999,15 +1000,10 @@ def fetch_search_filters():
         'query_types': [
             {'id': '1', 'name': '书名'},
         ],
-        'filter_format': '固定书名搜索，不再提供热度筛选。',
+        'filter_format': 'fanqie-reader 兼容书名搜索，只需要 query 参数。',
         'captured_filters': [
             '127,127,127,127',
         ],
-        'feeds': {
-            'latest_updates': '/api/latest-updates?offset=0&limit=20',
-            'recommend': '/api/recommend?type=3&offset=0&limit=10',
-            'hot_books': '/api/top-books?offset=0&limit=200',
-        },
     }
 
 
@@ -1054,12 +1050,10 @@ def fetch_search(query, query_type='1', filter_value='127,127,127,127', page_ind
         if snapshot_results:
             limited = snapshot_results[:page_count]
             return {**snapshot_result, 'results': limited, 'count': len(limited), 'query_type': query_type, 'filter': filter_value}
-    if live_error:
-        return {'results': [], 'query_type': query_type, 'filter': filter_value, 'error': live_error}
     try:
         html = fanqie_get_search_page_html(query, timeout=3)
     except Exception as exc:
-        return {'results': [], 'query_type': query_type, 'filter': filter_value, 'error': friendly_external_error(exc)}
+        return {'results': [], 'query_type': query_type, 'filter': filter_value, 'error': live_error or friendly_external_error(exc)}
     state = parse_initial_state(html)
     results = []
     if state:
@@ -1280,7 +1274,7 @@ def build_suite_stats():
 def build_interface_map():
     return {
         'same': False,
-        'summary': '本地合并版使用当前番茄网页版排行榜分类接口和无登录阅读器。',
+        'summary': '本地服务使用当前番茄网页版排行榜分类接口和 fanqie-reader 兼容的无登录阅读接口。',
         'login': '已移除。没有 /login、/register、JWT、用户表或会话依赖。',
         'features': SUITE_FEATURES,
         'capture': build_capture_summary(),
@@ -1289,10 +1283,7 @@ def build_interface_map():
             'rankings': '/api/rankings',
             'ranking_books': '/api/ranking?ranking_id=<web榜单ID>',
             'search_filters': '/api/search-filters',
-            'search': '/api/search?query=关键词&query_type=0&filter=127,127,127,127',
-            'latest_updates': '/api/latest-updates?offset=0&limit=20',
-            'recommend': '/api/recommend?type=3&offset=0&limit=10',
-            'hot_books': '/api/top-books?offset=0&limit=200',
+            'search': '/api/search?query=关键词',
             'book_detail': '/api/novels/<book_id>',
             'chapters': '/api/novels/<book_id>/chapters',
             'chapter_content': '/api/novels/<book_id>/chapters/<chapter_id>',
@@ -1377,12 +1368,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(build_suite_stats())
             if path == '/api/search-filters':
                 return self.send_json(fetch_search_filters())
-            if path == '/api/latest-updates':
-                return self.send_json(fetch_recent_updates(qs.get('offset', ['0'])[0], qs.get('limit', ['20'])[0]))
-            if path == '/api/recommend':
-                return self.send_json(fetch_recommend_books(qs.get('type', ['3'])[0], qs.get('offset', ['0'])[0], qs.get('limit', ['10'])[0]))
-            if path == '/api/top-books':
-                return self.send_json(fetch_top_books(qs.get('offset', ['0'])[0], qs.get('limit', ['200'])[0]))
             if path == '/api/rankings':
                 return self.send_json(fetch_leaderboards(qs.get('refresh', ['0'])[0] == '1'))
             if path == '/api/ranking':
